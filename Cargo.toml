@@ -1,0 +1,24 @@
+[package]
+name = "hyperiondb-client"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Native Node.js client for a HyperionDb / pg_replica Postgres cluster"
+license = "GPL-3.0-or-later"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+napi = { version = "=3.9.0", default-features = false, features = ["napi4"] }
+napi-derive = "=3.5.6"
+tokio = { version = "=1.52.3", features = ["rt-multi-thread", "macros"] }
+tokio-postgres = "=0.7.17"
+deadpool-postgres = "=0.14.1"
+
+[build-dependencies]
+napi-build = "=2.3.2"
+
+[profile.release]
+lto = true
+strip = "symbols"

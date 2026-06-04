@@ -1,0 +1,33 @@
+{
+  "name": "hyperiondb-client",
+  "version": "0.1.0",
+  "description": "Native Node.js client for a HyperionDb / pg_replica Postgres cluster — a primary-following connection pool over the N nodes.",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "license": "GPL-3.0-or-later",
+  "engines": {
+    "node": ">= 18"
+  },
+  "napi": {
+    "binaryName": "hyperiondb-client",
+    "targets": [
+      "x86_64-pc-windows-msvc",
+      "x86_64-unknown-linux-gnu",
+      "aarch64-unknown-linux-gnu",
+      "x86_64-apple-darwin",
+      "aarch64-apple-darwin"
+    ]
+  },
+  "files": [
+    "index.js",
+    "index.d.ts"
+  ],
+  "scripts": {
+    "build": "napi build --platform --release",
+    "build:debug": "napi build --platform",
+    "prepublishOnly": "napi prepublish -t npm"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "3.7.0"
+  }
+}
