@@ -7,7 +7,18 @@ never loops over connections.
 
 Status: **in progress**
 
-## Build
+## Install
+
+```bash
+npm install hyperiondb-client
+```
+
+Prebuilt binaries ship as per-platform optional dependencies
+(`hyperiondb-client-<triple>`) for Windows x64, macOS x64/arm64, and Linux x64/arm64
+(`gnu` and `musl`); npm installs only the one matching your platform. No Rust toolchain or
+build step is needed to consume the package.
+
+## Build (from source)
 
 ```bash
 npm install
@@ -169,3 +180,13 @@ npm run test:chaos   # stop the primary under write load, assert zero acked-writ
 default; override with `HYPERION_CTL` for the `docker/` cluster) and requires synchronous
 replication for true zero-loss. Run `npm test` against a fresh cluster — the chaos test
 relocates the primary.
+
+## Releasing
+
+`.github/workflows/release.yml` runs when a commit pushed to `main` contains `[cd]` in its
+message. It cross-builds the seven native targets, bumps the patch version (syncing
+`Cargo.toml`), commits the bump back, then publishes the per-platform
+`hyperiondb-client-<triple>` packages and the main package to npm. The bump commit has no
+`[cd]`, so it doesn't re-trigger a build/publish. Requires an `NPM_TOKEN` repository secret
+with publish rights; the version bump is pushed with the workflow's `GITHUB_TOKEN` (allow it
+in branch protection, or swap in a PAT).

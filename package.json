@@ -5,17 +5,24 @@
   "main": "client.js",
   "types": "client.d.ts",
   "license": "GPL-3.0-or-later",
+  "keywords": [
+    "postgres",
+    "raft",
+    "node",
+    "failover",
+    "replication"
+  ],
   "engines": {
-    "node": ">= 22"
+    "node": ">= v24"
   },
+  "author": "Tadas Talaikis <info@nordlet.com>",
   "napi": {
     "binaryName": "hyperiondb-client",
     "targets": [
-      "x86_64-pc-windows-msvc",
       "x86_64-unknown-linux-gnu",
       "aarch64-unknown-linux-gnu",
-      "x86_64-apple-darwin",
-      "aarch64-apple-darwin"
+      "x86_64-unknown-linux-musl",
+      "aarch64-unknown-linux-musl"
     ]
   },
   "files": [
@@ -28,10 +35,15 @@
     "build:debug": "napi build --platform",
     "test": "node --test --test-concurrency=1 test/types.test.js test/fence.test.js",
     "test:chaos": "node --test test/chaos.test.js",
-    "test:all": "node --test --test-concurrency=1 test/types.test.js test/fence.test.js test/chaos.test.js",
-    "prepublishOnly": "napi prepublish -t npm"
+    "test:all": "node --test --test-concurrency=1 test/types.test.js test/fence.test.js test/chaos.test.js"
   },
   "devDependencies": {
     "@napi-rs/cli": "3.7.0"
+  },
+  "optionalDependencies": {
+    "hyperiondb-client-linux-x64-gnu": "0.1.0",
+    "hyperiondb-client-linux-arm64-gnu": "0.1.0",
+    "hyperiondb-client-linux-x64-musl": "0.1.0",
+    "hyperiondb-client-linux-arm64-musl": "0.1.0"
   }
 }

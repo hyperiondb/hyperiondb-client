@@ -1,5 +1,7 @@
 /target
 node_modules
 *.node
+/npm
+/artifacts
 npm-debug.log*
 .DS_Store
