@@ -586,4 +586,7 @@ if (!nativeBinding) {
 }
 
 module.exports = nativeBinding
+module.exports.Pool = nativeBinding.Pool
+module.exports.Transaction = nativeBinding.Transaction
+module.exports.createPool = nativeBinding.createPool
 module.exports.hello = nativeBinding.hello
