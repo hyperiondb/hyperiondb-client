@@ -4,6 +4,16 @@ const native = require('./index.js')
 
 const SQLSTATE = /^\[SQLSTATE ([0-9A-Za-z]{5})\] ([\s\S]*)$/
 
+const SERIALIZATION = new Set(['40001', '40P01'])
+const CONNECTION_SQLSTATE = new Set([
+  '08000', '08003', '08006', '08001', '08004', '08007',
+  '57P01', '57P02', '57P03', '53300', '53400',
+])
+const READ_MODES = new Set(['read-only', 'readonly', 'ro', 'prefer-standby', 'preferstandby'])
+const DEFAULT_RETRY = { maxAttempts: 3, baseDelayMs: 50, maxDelayMs: 1000 }
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
 function decorate(error) {
   if (error && typeof error.message === 'string') {
     const match = SQLSTATE.exec(error.message)
@@ -13,6 +23,37 @@ function decorate(error) {
     }
   }
   return error
+}
+
+function isSerialization(error) {
+  return !!error && SERIALIZATION.has(error.code)
+}
+
+function isConnectionError(error) {
+  if (!error) return false
+  if (error.code) return CONNECTION_SQLSTATE.has(error.code)
+  return typeof error.message === 'string' &&
+    /no writable primary|connection|closed|terminat|reset|broken pipe|server closed/i.test(error.message)
+}
+
+function isRetryable(error) {
+  return isSerialization(error) || isConnectionError(error)
+}
+
+function inDoubt(cause) {
+  const error = new Error(`transaction commit outcome unknown (in doubt): ${cause.message}`)
+  error.code = 'IN_DOUBT'
+  error.cause = cause
+  return error
+}
+
+function backoff(attempt, cfg) {
+  const base = Math.min(cfg.baseDelayMs * 2 ** (attempt - 1), cfg.maxDelayMs)
+  return Math.round(base * (0.5 + Math.random() * 0.5))
+}
+
+function quoteIdent(name) {
+  return '"' + String(name).replace(/"/g, '""') + '"'
 }
 
 async function guard(run) {
@@ -27,9 +68,7 @@ function emit(logger, event) {
   if (logger) {
     try {
       logger(event)
-    } catch {
-      // a logging hook must never break a query
-    }
+    } catch {}
   }
 }
 
@@ -78,16 +117,60 @@ class Transaction {
 
 class Pool {
   constructor(options) {
-    const { logger, ...nativeOptions } = options
+    const { logger, retry, ...nativeOptions } = options
     this._logger = logger
+    this._retry = { ...DEFAULT_RETRY, ...(retry || {}) }
+    this._retryReads = READ_MODES.has(options.mode)
     this._inner = native.createPool(nativeOptions)
   }
 
   async query(sql, params, opts) {
     checkAborted(opts)
-    return runLogged(this._logger, sql, () =>
-      this._inner.query(sql, params ?? null, opts?.timeoutMs ?? null, opts?.signal ?? null),
-    )
+    const retry = opts?.retry ?? this._retryReads
+    const max = retry ? this._retry.maxAttempts : 1
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        return await runLogged(this._logger, sql, () =>
+          this._inner.query(sql, params ?? null, opts?.timeoutMs ?? null, opts?.signal ?? null),
+        )
+      } catch (error) {
+        if (retry && isRetryable(error) && attempt < max && !opts?.signal?.aborted) {
+          await sleep(backoff(attempt, this._retry))
+          continue
+        }
+        throw error
+      }
+    }
+  }
+
+  async insert(table, row, opts) {
+    const columns = Object.keys(row)
+    const placeholders = columns.map((_, index) => '$' + (index + 1)).join(', ')
+    const params = columns.map((column) => row[column])
+    const idempotent = opts?.idempotency === true
+    let onConflict = ''
+    if (idempotent) {
+      const target = opts?.conflictTarget ?? '_id'
+      const targets = Array.isArray(target) ? target : [target]
+      onConflict = ` ON CONFLICT (${targets.map(quoteIdent).join(', ')}) DO NOTHING`
+    }
+    const sql = `INSERT INTO ${quoteIdent(table)} (${columns.map(quoteIdent).join(', ')}) ` +
+      `VALUES (${placeholders})${onConflict} RETURNING *`
+
+    const max = idempotent ? this._retry.maxAttempts : 1
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        return await runLogged(this._logger, sql, () =>
+          this._inner.query(sql, params, opts?.timeoutMs ?? null, opts?.signal ?? null),
+        )
+      } catch (error) {
+        if (idempotent && isRetryable(error) && attempt < max) {
+          await sleep(backoff(attempt, this._retry))
+          continue
+        }
+        throw error
+      }
+    }
   }
 
   async begin() {
@@ -95,19 +178,37 @@ class Pool {
     return new Transaction(inner, this._logger)
   }
 
-  async transaction(callback) {
-    const tx = await this.begin()
-    try {
-      const result = await callback(tx)
-      await tx.commit()
-      return result
-    } catch (error) {
+  async transaction(callback, opts) {
+    const max = opts?.maxAttempts ?? this._retry.maxAttempts
+    for (let attempt = 1; ; attempt += 1) {
+      let tx
       try {
-        await tx.rollback()
-      } catch {
-        // surface the original error, not a secondary rollback failure
+        tx = await this.begin()
+        const result = await callback(tx)
+        try {
+          await tx.commit()
+        } catch (commitError) {
+          if (isSerialization(commitError) && attempt < max) {
+            await sleep(backoff(attempt, this._retry))
+            continue
+          }
+          if (isConnectionError(commitError)) throw inDoubt(commitError)
+          throw commitError
+        }
+        return result
+      } catch (error) {
+        if (error.code === 'IN_DOUBT') throw error
+        if (tx) {
+          try {
+            await tx.rollback()
+          } catch {}
+        }
+        if (isRetryable(error) && attempt < max) {
+          await sleep(backoff(attempt, this._retry))
+          continue
+        }
+        throw error
       }
-      throw error
     }
   }
 

@@ -106,6 +106,40 @@ try {
 All statements in a transaction run on one dedicated connection. Repeated SQL reuses a
 server-side prepared statement (deadpool `prepare_cached`).
 
+## Retries & idempotency
+
+`transaction(cb)` retries the whole callback on serialization/deadlock (`40001`/`40P01`) and
+on connection failures that happen *before* `COMMIT`. A failure *during* `COMMIT` is ambiguous
+(the write may have landed), so it is surfaced as `error.code === 'IN_DOUBT'` and **never**
+auto-retried — handle that one idempotently.
+
+```js
+await pool.transaction(async (tx) => { /* ... */ }, { maxAttempts: 5 })
+```
+
+Reads can be retried too — on by default for `read-only`/`prefer-standby` pools (every query
+is a read); on a `read-write` pool opt a specific read in with `{ retry: true }`:
+
+```js
+const rows = await pool.query('select …', [], { retry: true })
+```
+
+`insert(table, row, { idempotency: true })` makes a write safe to retry through the in-doubt
+window by adding `ON CONFLICT (<conflictTarget>) DO NOTHING` (the conflict key defaults to
+`_id`, which is any unique column — `varchar`/`text`, `uuid`, etc.). A re-applied row collapses to a
+no-op and returns `[]`:
+
+```js
+const requestId = 'evt-2026-06-05-abc123' // any client-supplied unique key
+const [order] = await pool.insert('orders', { _id: requestId, amount: 100 }, { idempotency: true })
+// a duplicate retry returns []  — the row exists exactly once
+```
+
+Retry policy is per-pool: `createPool({ …, retry: { maxAttempts, baseDelayMs, maxDelayMs } })`
+(defaults `3 / 50 / 1000`). This is the Postgres-side equivalent of MongoDB's retryable
+writes — except the in-doubt commit needs your idempotency key, since Postgres has no built-in
+per-statement dedup token.
+
 ## Cancellation & timeouts
 
 `query` takes an optional third argument. Both a timeout and an `AbortSignal` cancel the

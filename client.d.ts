@@ -21,6 +21,17 @@ export interface PoolOptions {
   applicationName?: string
   /** Called once per query with timing and outcome. Errors thrown here are ignored. */
   logger?: (event: QueryEvent) => void
+  /** Retry policy for retryable reads, `transaction(cb)`, and idempotent `insert`. */
+  retry?: RetryOptions
+}
+
+export interface RetryOptions {
+  /** Max total attempts (1 = no retry). Defaults to 3. */
+  maxAttempts?: number
+  /** First backoff delay in ms (doubles per attempt, jittered). Defaults to 50. */
+  baseDelayMs?: number
+  /** Backoff cap in ms. Defaults to 1000. */
+  maxDelayMs?: number
 }
 
 export interface QueryEvent {
@@ -60,11 +71,36 @@ export interface QueryOptions {
   timeoutMs?: number
   /** Abort the query (server-side cancel) when the signal fires. */
   signal?: AbortSignal
+  /**
+   * Retry on transient errors (serialization/deadlock, connection loss). Only safe for
+   * reads or idempotent statements. Defaults to true on `read-only`/`prefer-standby` pools,
+   * false otherwise — set explicitly to opt a specific query in or out.
+   */
+  retry?: boolean
 }
 
-/** A PostgreSQL `Error` carries the 5-character SQLSTATE on `.code`. */
+export interface InsertOptions {
+  /** Add `ON CONFLICT (<conflictTarget>) DO NOTHING`, making the insert safely retryable. */
+  idempotency?: boolean
+  /** Conflict key for idempotent inserts. Defaults to `'_id'`. */
+  conflictTarget?: string | string[]
+  timeoutMs?: number
+  signal?: AbortSignal
+}
+
+export interface TransactionOptions {
+  /** Max total attempts for the retry loop. Defaults to the pool's `retry.maxAttempts`. */
+  maxAttempts?: number
+}
+
+/**
+ * A PostgreSQL `Error` carries the 5-character SQLSTATE on `.code`. A `transaction(cb)`
+ * whose `COMMIT` is lost to a connection failure (outcome unknown) throws with
+ * `code === 'IN_DOUBT'` and is never auto-retried.
+ */
 export interface DbError extends Error {
   code?: string
+  cause?: unknown
 }
 
 export interface Transaction {
@@ -75,10 +111,20 @@ export interface Transaction {
 
 export interface Pool {
   query<T = Row>(sql: string, params?: Param[], opts?: QueryOptions): Promise<T[]>
+  /**
+   * Insert `row` into `table`, returning the inserted row(s). With `idempotency: true` a
+   * re-applied row collapses to a no-op (`ON CONFLICT (<conflictTarget>) DO NOTHING`),
+   * making the write safe to retry through the in-doubt window — a duplicate returns `[]`.
+   */
+  insert<T = Row>(table: string, row: Record<string, Param>, opts?: InsertOptions): Promise<T[]>
   /** Begin a transaction on a dedicated connection. Remember to `commit()` or `rollback()`. */
   begin(): Promise<Transaction>
-  /** Run `fn` inside a transaction, auto `COMMIT` on resolve and `ROLLBACK` on throw. */
-  transaction<T>(fn: (tx: Transaction) => Promise<T>): Promise<T>
+  /**
+   * Run `fn` inside a transaction, auto `COMMIT` on resolve and `ROLLBACK` on throw, retrying
+   * the whole callback on serialization/deadlock and pre-commit connection failures. A failure
+   * during `COMMIT` is surfaced as a `code === 'IN_DOUBT'` error and never auto-retried.
+   */
+  transaction<T>(fn: (tx: Transaction) => Promise<T>, opts?: TransactionOptions): Promise<T>
   /** Live pool counters: size, idle, in-use, and waiters. */
   status(): PoolStatus
   /** Drain and close the pool. */

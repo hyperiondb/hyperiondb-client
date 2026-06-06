@@ -26,7 +26,7 @@ test('scalars round-trip with the right JS types', async () => {
   await pool.query('truncate t_types')
   await pool.query(
     `insert into t_types (a,b,c,d,e,f,g,h,i,j,k,l,m,n) values
-     ($1,$2,$3,$4,$5,$6,$7,$8,$9::text::uuid,$10,$11,$12::text::numeric,$13,$14)`,
+     ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::text::numeric,$13,$14)`,
     [1, 2, 9007199254740993n, 1.5, 2.5, true, 'hi', { x: 1, y: [2, 3] }, uuid,
      Buffer.from([1, 2, 3, 255]), new Date('2026-06-05T12:00:00.000Z'), '12345.6789', [10, 20, 30], ['a', 'b']],
   )

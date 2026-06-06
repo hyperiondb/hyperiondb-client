@@ -692,7 +692,12 @@ impl ToSql for Param {
             Param::Bool(value) => value.to_sql(ty, out),
             Param::Float(value) => float_to_sql(*value, ty, out),
             Param::Big(value) => big_to_sql(*value, ty, out),
-            Param::Text(value) => value.to_sql(ty, out),
+            Param::Text(value) => match ty.name() {
+                "uuid" => Uuid::parse_str(value)
+                    .map_err(|error| Box::new(error) as Box<dyn StdError + Sync + Send>)?
+                    .to_sql(ty, out),
+                _ => value.to_sql(ty, out),
+            },
             Param::Bytes(value) => value.as_slice().to_sql(ty, out),
             Param::Instant(value) => value.to_sql(ty, out),
             Param::List(items) => list_to_sql(items, ty, out),

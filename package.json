@@ -1,6 +1,6 @@
 {
   "name": "hyperiondb-client",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Native Node.js client for a HyperionDb / pg_replica Postgres cluster — a primary-following connection pool over the N nodes.",
   "main": "client.js",
   "types": "client.d.ts",
@@ -33,17 +33,18 @@
   "scripts": {
     "build": "napi build --platform --release",
     "build:debug": "napi build --platform",
-    "test": "node --test --test-concurrency=1 test/types.test.js test/fence.test.js",
+    "test": "node --test --test-concurrency=1 test/types.test.js test/retry.test.js test/fence.test.js",
     "test:chaos": "node --test test/chaos.test.js",
-    "test:all": "node --test --test-concurrency=1 test/types.test.js test/fence.test.js test/chaos.test.js"
+    "test:all": "node --test --test-concurrency=1 test/types.test.js test/retry.test.js test/fence.test.js test/chaos.test.js"
   },
   "devDependencies": {
     "@napi-rs/cli": "3.7.0"
   },
+  "homepage": "https://github.com/hyperiondb/node-addon",
   "optionalDependencies": {
-    "hyperiondb-client-linux-x64-gnu": "0.1.0",
-    "hyperiondb-client-linux-arm64-gnu": "0.1.0",
-    "hyperiondb-client-linux-x64-musl": "0.1.0",
-    "hyperiondb-client-linux-arm64-musl": "0.1.0"
+    "hyperiondb-client-linux-x64-gnu": "0.2.0",
+    "hyperiondb-client-linux-arm64-gnu": "0.2.0",
+    "hyperiondb-client-linux-x64-musl": "0.2.0",
+    "hyperiondb-client-linux-arm64-musl": "0.2.0"
   }
 }
