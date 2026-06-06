@@ -447,6 +447,7 @@ fn scalar_cell(row: &Row, index: usize, name: &str) -> Result<Cell> {
         "timestamp" => opt(get::<PrimitiveDateTime>(row, index)?, primitive_cell),
         "date" => opt(get::<PgDate>(row, index)?, |value| Cell::Text(iso_date(value))),
         "time" => opt(get::<PgTime>(row, index)?, |value| Cell::Text(iso_time(value))),
+        "geography" | "geometry" => opt(get::<RawWkb>(row, index)?, |value| Cell::Text(value.0)),
         other => {
             return Err(Error::from_reason(format!(
                 "query: unsupported column type `{other}` at column `{}`",
@@ -488,6 +489,26 @@ fn get<'a, T: FromSql<'a>>(row: &'a Row, index: usize) -> Result<Option<T>> {
 
 fn opt<T>(value: Option<T>, map: impl FnOnce(T) -> Cell) -> Cell {
     value.map(map).unwrap_or(Cell::Null)
+}
+
+struct RawWkb(String);
+
+impl<'a> FromSql<'a> for RawWkb {
+    fn from_sql(
+        _ty: &Type,
+        raw: &'a [u8],
+    ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        use std::fmt::Write;
+        let mut hex = String::with_capacity(raw.len() * 2);
+        for byte in raw {
+            let _ = write!(hex, "{byte:02X}");
+        }
+        Ok(RawWkb(hex))
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        matches!(ty.name(), "geography" | "geometry")
+    }
 }
 
 fn list_of<'a, T, F>(row: &'a Row, index: usize, map: F) -> Result<Cell>
