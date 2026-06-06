@@ -11,36 +11,24 @@ env:
 jobs:
   version:
     if: contains(github.event.head_commit.message, '[cd]')
-    name: bump version
+    name: compute version
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     outputs:
       version: ${{ steps.bump.outputs.version }}
-      sha: ${{ steps.bump.outputs.sha }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-        with:
-          fetch-depth: 0
 
       - name: Setup Node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 24
 
-      - name: Bump and push
+      - name: Compute next version
         id: bump
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          npm version patch --no-git-tag-version
+          npm version patch --no-git-tag-version > /dev/null
           VERSION="$(node -p "require('./package.json').version")"
-          sed -i -E "0,/^version = \".*\"/ s//version = \"$VERSION\"/" Cargo.toml
-          git add package.json Cargo.toml
-          git commit -m "release: v$VERSION"
-          git push origin HEAD:${{ github.ref_name }}
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
   build:
     name: build ${{ matrix.settings.target }}
@@ -73,8 +61,6 @@ jobs:
             build: napi build --platform --release --target aarch64-unknown-linux-musl --cross-compile
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-        with:
-          ref: ${{ needs.version.outputs.sha }}
 
       - name: Setup Node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
@@ -88,7 +74,9 @@ jobs:
 
       - name: Setup zig
         if: runner.os == 'Linux'
-        uses: mlugg/setup-zig@53fc45b17fe98b52f92ee5ea08ff48a85a3e7eb7 # v1.2.2
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.14.1
 
       - name: Setup cargo-zigbuild
         if: runner.os == 'Linux'
@@ -114,16 +102,19 @@ jobs:
     name: publish to npm
     needs: [version, build]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-        with:
-          ref: ${{ needs.version.outputs.sha }}
 
       - name: Setup Node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: v24
           registry-url: https://registry.npmjs.org
+
+      - name: Set version
+        run: npm version ${{ needs.version.outputs.version }} --no-git-tag-version --allow-same-version
 
       - name: Install dependencies
         run: npm install
@@ -147,3 +138,29 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  commit:
+    name: commit version bump
+    needs: [version, publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+
+      - name: Bump and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          npm version ${{ needs.version.outputs.version }} --no-git-tag-version --allow-same-version
+          sed -i -E "0,/^version = \".*\"/ s//version = \"${{ needs.version.outputs.version }}\"/" Cargo.toml
+          git add package.json Cargo.toml
+          git commit -m "release: v${{ needs.version.outputs.version }}"
+          git push origin HEAD:${{ github.ref_name }}
