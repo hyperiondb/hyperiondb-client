@@ -85,7 +85,9 @@ test('connection failure during COMMIT surfaces IN_DOUBT and is not retried', as
     const tx = await realBegin()
     tx.commit = async () => {
       await tx.rollback().catch(() => {})
-      throw new Error('server closed the connection unexpectedly')
+      const error = new Error('server closed the connection unexpectedly')
+      error.code = '08006'
+      throw error
     }
     return tx
   }

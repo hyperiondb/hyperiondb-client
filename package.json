@@ -40,7 +40,7 @@
   "devDependencies": {
     "@napi-rs/cli": "3.7.0"
   },
-  "homepage": "https://github.com/hyperiondb/node-addon",
+  "homepage": "https://github.com/hyperiondb/hyperiondb-client",
   "optionalDependencies": {
     "hyperiondb-client-linux-x64-gnu": "0.2.0",
     "hyperiondb-client-linux-arm64-gnu": "0.2.0",

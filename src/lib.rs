@@ -1,11 +1,12 @@
 use std::error::Error as StdError;
-use std::future::pending;
+use std::future::{pending, Future};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::BytesMut;
 use deadpool_postgres::{
-    Hook, HookError, Manager, ManagerConfig, Object as PooledClient, Pool as DeadpoolPool,
+    Connect, Hook, HookError, Manager, ManagerConfig, Object as PooledClient, Pool as DeadpoolPool,
     RecyclingMethod,
 };
 use napi::bindgen_prelude::*;
@@ -14,6 +15,7 @@ use napi_derive::napi;
 use serde_json::{Number, Value};
 use time::{Date as PgDate, OffsetDateTime, PrimitiveDateTime, Time as PgTime};
 use tokio::sync::{Mutex, Notify};
+use tokio::task::JoinHandle;
 use tokio_postgres::config::{LoadBalanceHosts, TargetSessionAttrs};
 use tokio_postgres::types::{to_sql_checked, FromSql, IsNull, Kind, ToSql, Type};
 use tokio_postgres::{Config, NoTls, Row};
@@ -115,19 +117,6 @@ impl Pool {
             config.password(password.as_str());
         }
         config.dbname(options.database.as_str());
-        match routing {
-            Routing::ReadWrite => {
-                config.target_session_attrs(TargetSessionAttrs::ReadWrite);
-            }
-            Routing::ReadOnly => {
-                config.target_session_attrs(TargetSessionAttrs::ReadOnly);
-                config.load_balance_hosts(LoadBalanceHosts::Random);
-            }
-            Routing::PreferStandby | Routing::Any => {
-                config.target_session_attrs(TargetSessionAttrs::Any);
-                config.load_balance_hosts(LoadBalanceHosts::Random);
-            }
-        }
         if let Some(ms) = options.connect_timeout_ms {
             config.connect_timeout(Duration::from_millis(ms as u64));
         }
@@ -138,13 +127,37 @@ impl Pool {
             config.application_name(name.as_str());
         }
 
-        let manager = Manager::from_config(
-            config,
-            NoTls,
-            ManagerConfig {
-                recycling_method: RecyclingMethod::Fast,
-            },
-        );
+        let manager_config = ManagerConfig {
+            recycling_method: RecyclingMethod::Fast,
+        };
+        let manager = match routing {
+            Routing::ReadWrite => {
+                let mut config = config;
+                config.target_session_attrs(TargetSessionAttrs::ReadWrite);
+                Manager::from_config(config, NoTls, manager_config)
+            }
+            Routing::ReadOnly => {
+                let mut config = config;
+                config.target_session_attrs(TargetSessionAttrs::ReadOnly);
+                config.load_balance_hosts(LoadBalanceHosts::Random);
+                Manager::from_config(config, NoTls, manager_config)
+            }
+            Routing::Any => {
+                let mut config = config;
+                config.target_session_attrs(TargetSessionAttrs::Any);
+                config.load_balance_hosts(LoadBalanceHosts::Random);
+                Manager::from_config(config, NoTls, manager_config)
+            }
+            Routing::PreferStandby => {
+                let mut standby = config.clone();
+                standby.target_session_attrs(TargetSessionAttrs::ReadOnly);
+                standby.load_balance_hosts(LoadBalanceHosts::Random);
+                let mut fallback = config;
+                fallback.target_session_attrs(TargetSessionAttrs::Any);
+                fallback.load_balance_hosts(LoadBalanceHosts::Random);
+                Manager::from_connect(fallback, PreferStandbyConnect { standby }, manager_config)
+            }
+        };
         let pool_size = options.pool_size.unwrap_or(10).max(1) as usize;
         let mut builder = DeadpoolPool::builder(manager).max_size(pool_size);
         if matches!(routing, Routing::ReadWrite) {
@@ -321,9 +334,65 @@ async fn notified_opt(abort: &Option<Arc<Notify>>) {
 fn map_pg_error(error: tokio_postgres::Error) -> Error {
     if let Some(db) = error.as_db_error() {
         Error::from_reason(format!("[SQLSTATE {}] {}", db.code().code(), db.message()))
+    } else if is_connection_error(&error) {
+        Error::from_reason(format!("[SQLSTATE 08006] {error}"))
     } else {
         Error::from_reason(error.to_string())
     }
+}
+
+fn is_connection_error(error: &tokio_postgres::Error) -> bool {
+    if error.is_closed() {
+        return true;
+    }
+    let mut source = error.source();
+    while let Some(inner) = source {
+        if inner.downcast_ref::<std::io::Error>().is_some() {
+            return true;
+        }
+        source = inner.source();
+    }
+    false
+}
+
+struct PreferStandbyConnect {
+    standby: Config,
+}
+
+impl Connect for PreferStandbyConnect {
+    fn connect<'a>(
+        &'a self,
+        fallback: &Config,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = std::result::Result<
+                        (tokio_postgres::Client, JoinHandle<()>),
+                        tokio_postgres::Error,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        let standby = self.standby.clone();
+        let fallback = fallback.clone();
+        Box::pin(async move {
+            match connect_and_spawn(&standby).await {
+                Ok(pair) => Ok(pair),
+                Err(_) => connect_and_spawn(&fallback).await,
+            }
+        })
+    }
+}
+
+async fn connect_and_spawn(
+    config: &Config,
+) -> std::result::Result<(tokio_postgres::Client, JoinHandle<()>), tokio_postgres::Error> {
+    let (client, connection) = config.connect(NoTls).await?;
+    let handle = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    Ok((client, handle))
 }
 
 fn writable_check() -> Hook {
@@ -355,7 +424,7 @@ async fn checkout(pool: &DeadpoolPool, window: Duration) -> Result<PooledClient>
             Err(error) => {
                 if start.elapsed() >= window {
                     return Err(Error::from_reason(format!(
-                        "query: no writable primary available after {}ms: {error}",
+                        "[SQLSTATE 08006] query: no writable primary available after {}ms: {error}",
                         window.as_millis()
                     )));
                 }

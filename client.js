@@ -30,10 +30,7 @@ function isSerialization(error) {
 }
 
 function isConnectionError(error) {
-  if (!error) return false
-  if (error.code) return CONNECTION_SQLSTATE.has(error.code)
-  return typeof error.message === 'string' &&
-    /no writable primary|connection|closed|terminat|reset|broken pipe|server closed/i.test(error.message)
+  return !!error && !!error.code && CONNECTION_SQLSTATE.has(error.code)
 }
 
 function isRetryable(error) {

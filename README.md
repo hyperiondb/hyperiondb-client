@@ -5,7 +5,7 @@ connection pool over the N nodes, written in Rust with [napi-rs](https://napi.rs
 `tokio-postgres`. Routing, primary detection, pooling and failover recovery live in Rust — JS
 never loops over connections.
 
-Status: **in progress**
+Status: **in production**
 
 ## Install
 
@@ -77,10 +77,13 @@ backoff up to `acquireTimeoutMs` and then throws `no writable primary available 
 
 ### Read scaling
 
-`mode: 'read-only'` routes to standbys (`target_session_attrs=read-only`); `'prefer-standby'`
-and `'any'` use `target_session_attrs=any` with random host load-balancing. (tokio-postgres
-0.7.x has no server-side standby *preference*, so `'prefer-standby'` spreads reads across all
-reachable nodes rather than strictly favoring standbys.)
+`mode: 'read-only'` routes strictly to standbys (`target_session_attrs=read-only`, random
+host load-balancing) and fails if none is reachable. `'prefer-standby'` connects standby-first
+and only falls back to the primary when no standby is reachable: each pooled connection first
+attempts a `target_session_attrs=read-only` connect (standbys only) and, if that finds no host,
+retries with `target_session_attrs=any`. `'any'` uses `target_session_attrs=any` with random
+host load-balancing and does not favor standbys. (tokio-postgres 0.7.x has no server-side
+`prefer-standby` attribute, so the fallback is done client-side over two connect attempts.)
 
 ## Transactions
 
