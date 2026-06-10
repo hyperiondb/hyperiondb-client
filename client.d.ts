@@ -1,5 +1,7 @@
 export type Mode = 'read-write' | 'read-only' | 'prefer-standby' | 'any'
 
+export type IsolationLevel = 'read-committed' | 'repeatable-read' | 'serializable'
+
 export interface PoolOptions {
   /** One entry per cluster node. The pool races them per `mode`. */
   hosts: string[]
@@ -18,6 +20,7 @@ export interface PoolOptions {
   acquireTimeoutMs?: number
   /** Server-enforced `statement_timeout` (ms) set on every pooled connection. */
   statementTimeoutMs?: number
+  validationIntervalMs?: number
   applicationName?: string
   /** Called once per query with timing and outcome. Errors thrown here are ignored. */
   logger?: (event: QueryEvent) => void
@@ -91,6 +94,11 @@ export interface InsertOptions {
 export interface TransactionOptions {
   /** Max total attempts for the retry loop. Defaults to the pool's `retry.maxAttempts`. */
   maxAttempts?: number
+  isolation?: IsolationLevel
+}
+
+export interface BeginOptions {
+  isolation?: IsolationLevel
 }
 
 /**
@@ -118,7 +126,7 @@ export interface Pool {
    */
   insert<T = Row>(table: string, row: Record<string, Param>, opts?: InsertOptions): Promise<T[]>
   /** Begin a transaction on a dedicated connection. Remember to `commit()` or `rollback()`. */
-  begin(): Promise<Transaction>
+  begin(opts?: BeginOptions): Promise<Transaction>
   /**
    * Run `fn` inside a transaction, auto `COMMIT` on resolve and `ROLLBACK` on throw, retrying
    * the whole callback on serialization/deadlock and pre-commit connection failures. A failure

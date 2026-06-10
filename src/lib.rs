@@ -1,13 +1,14 @@
 use std::error::Error as StdError;
 use std::future::{pending, Future};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use bytes::BytesMut;
+use bytes::{BufMut, BytesMut};
 use deadpool_postgres::{
     Connect, Hook, HookError, Manager, ManagerConfig, Object as PooledClient, Pool as DeadpoolPool,
-    RecyclingMethod,
+    PoolError, RecyclingMethod,
 };
 use napi::bindgen_prelude::*;
 use napi::{sys, type_of, ValueType};
@@ -22,6 +23,10 @@ use tokio_postgres::{Config, NoTls, Row};
 use uuid::Uuid;
 
 type SqlResult = std::result::Result<IsNull, Box<dyn StdError + Sync + Send>>;
+type SqlError = Box<dyn StdError + Sync + Send>;
+
+const DRAIN_GRACE: Duration = Duration::from_millis(1000);
+const ABORT_SLOT: &str = "__hyperiondbAbortFlag";
 
 #[napi]
 pub fn hello(name: String) -> String {
@@ -39,6 +44,7 @@ pub struct PoolOptions {
     pub connect_timeout_ms: Option<u32>,
     pub acquire_timeout_ms: Option<u32>,
     pub statement_timeout_ms: Option<u32>,
+    pub validation_interval_ms: Option<u32>,
     pub mode: Option<String>,
     pub application_name: Option<String>,
 }
@@ -61,6 +67,19 @@ enum Routing {
 }
 
 fn split_host_port(entry: &str, default_port: u16) -> (&str, u16) {
+    if let Some(rest) = entry.strip_prefix('[') {
+        if let Some(end) = rest.find(']') {
+            let host = &rest[..end];
+            let tail = &rest[end + 1..];
+            if tail.is_empty() {
+                return (host, default_port);
+            }
+            if let Some(port) = tail.strip_prefix(':').and_then(|p| p.parse::<u16>().ok()) {
+                return (host, port);
+            }
+        }
+        return (entry, default_port);
+    }
     if let Some(index) = entry.rfind(':') {
         let (host, rest) = entry.split_at(index);
         if !host.is_empty() && !host.contains(':') {
@@ -84,10 +103,24 @@ fn parse_mode(mode: Option<&str>) -> Result<Routing> {
     }
 }
 
+fn begin_statement(isolation: Option<&str>) -> Result<&'static str> {
+    match isolation {
+        None => Ok("BEGIN"),
+        Some("read-committed") => Ok("BEGIN ISOLATION LEVEL READ COMMITTED"),
+        Some("repeatable-read") => Ok("BEGIN ISOLATION LEVEL REPEATABLE READ"),
+        Some("serializable") => Ok("BEGIN ISOLATION LEVEL SERIALIZABLE"),
+        Some(other) => Err(Error::from_reason(format!(
+            "begin: unknown isolation `{other}` (expected read-committed | repeatable-read | serializable)"
+        ))),
+    }
+}
+
 #[napi]
 pub struct Pool {
     inner: DeadpoolPool,
     acquire_timeout: Duration,
+    evict_read_only: bool,
+    unavailable: &'static str,
 }
 
 #[napi]
@@ -161,16 +194,25 @@ impl Pool {
         let pool_size = options.pool_size.unwrap_or(10).max(1) as usize;
         let mut builder = DeadpoolPool::builder(manager).max_size(pool_size);
         if matches!(routing, Routing::ReadWrite) {
-            builder = builder.pre_recycle(writable_check());
+            let interval =
+                Duration::from_millis(options.validation_interval_ms.unwrap_or(0) as u64);
+            builder = builder.pre_recycle(writable_check(interval));
         }
         let inner = builder.build().map_err(|error| {
             Error::from_reason(format!("createPool: failed to build pool: {error}"))
         })?;
 
         let acquire_timeout = Duration::from_millis(options.acquire_timeout_ms.unwrap_or(5000) as u64);
+        let unavailable = match routing {
+            Routing::ReadWrite => "no writable primary available",
+            Routing::ReadOnly => "no standby available",
+            Routing::PreferStandby | Routing::Any => "no reachable node",
+        };
         Ok(Pool {
             inner,
             acquire_timeout,
+            evict_read_only: matches!(routing, Routing::ReadWrite),
+            unavailable,
         })
     }
 
@@ -185,18 +227,38 @@ impl Pool {
         timeout_ms: Option<u32>,
         signal: Option<AbortBridge>,
     ) -> Result<Vec<RowObject>> {
-        let pool = self.inner.clone();
-        let client = checkout(&pool, self.acquire_timeout).await?;
-        run_query(&client, &sql, &params.unwrap_or_default(), timeout_ms, signal).await
+        let params = params.unwrap_or_default();
+        let abort = signal.map(|bridge| bridge.flag);
+        let start = Instant::now();
+        loop {
+            let remaining = self.acquire_timeout.saturating_sub(start.elapsed());
+            let client = checkout(&self.inner, remaining, self.unavailable).await?;
+            let (result, clean) = run_query(&client, &sql, &params, timeout_ms, abort.clone()).await;
+            if !clean {
+                let _ = PooledClient::take(client);
+                return result;
+            }
+            match result {
+                Err(error) if self.evict_read_only && is_sqlstate(&error, "25006") => {
+                    let _ = PooledClient::take(client);
+                    if start.elapsed() >= self.acquire_timeout {
+                        return Err(error);
+                    }
+                }
+                other => return other,
+            }
+        }
     }
 
     #[napi]
-    pub async fn begin(&self) -> Result<Transaction> {
-        let pool = self.inner.clone();
-        let client = checkout(&pool, self.acquire_timeout).await?;
-        client.batch_execute("BEGIN").await.map_err(map_pg_error)?;
+    pub async fn begin(&self, isolation: Option<String>) -> Result<Transaction> {
+        let begin_sql = begin_statement(isolation.as_deref())?;
+        let client = checkout(&self.inner, self.acquire_timeout, self.unavailable).await?;
+        client.batch_execute(begin_sql).await.map_err(map_pg_error)?;
         Ok(Transaction {
             client: Arc::new(Mutex::new(Some(client))),
+            evict: Arc::new(AtomicBool::new(false)),
+            poisoned: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -222,6 +284,8 @@ impl Pool {
 #[napi]
 pub struct Transaction {
     client: Arc<Mutex<Option<PooledClient>>>,
+    evict: Arc<AtomicBool>,
+    poisoned: Arc<AtomicBool>,
 }
 
 #[napi]
@@ -241,7 +305,18 @@ impl Transaction {
         let client = guard.as_ref().ok_or_else(|| {
             Error::from_reason("transaction: already committed or rolled back")
         })?;
-        run_query(client, &sql, &params.unwrap_or_default(), timeout_ms, signal).await
+        let abort = signal.map(|bridge| bridge.flag);
+        let (result, clean) =
+            run_query(client, &sql, &params.unwrap_or_default(), timeout_ms, abort).await;
+        if !clean {
+            self.poisoned.store(true, Ordering::Relaxed);
+        }
+        if let Err(error) = &result {
+            if is_sqlstate(error, "25006") {
+                self.evict.store(true, Ordering::Relaxed);
+            }
+        }
+        result
     }
 
     #[napi]
@@ -261,22 +336,88 @@ impl Transaction {
         let client = guard.take().ok_or_else(|| {
             Error::from_reason("transaction: already committed or rolled back")
         })?;
-        client.batch_execute(verb).await.map_err(map_pg_error)?;
-        Ok(())
+        if self.poisoned.load(Ordering::Relaxed) {
+            drop(PooledClient::take(client));
+            return if verb == "COMMIT" {
+                Err(Error::from_reason(
+                    "[SQLSTATE 08006] transaction: connection abandoned after an unresponsive cancel; transaction was rolled back",
+                ))
+            } else {
+                Ok(())
+            };
+        }
+        let result = client.batch_execute(verb).await.map_err(map_pg_error);
+        if self.evict.load(Ordering::Relaxed) {
+            drop(PooledClient::take(client));
+        }
+        result.map(|_| ())
+    }
+}
+
+impl Drop for Transaction {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.client.try_lock() {
+            if let Some(client) = guard.take() {
+                drop(PooledClient::take(client));
+            }
+        }
+    }
+}
+
+struct AbortFlag {
+    aborted: AtomicBool,
+    notify: Notify,
+}
+
+impl AbortFlag {
+    fn new() -> Self {
+        AbortFlag {
+            aborted: AtomicBool::new(false),
+            notify: Notify::new(),
+        }
+    }
+
+    fn trigger(&self) {
+        self.aborted.store(true, Ordering::SeqCst);
+        self.notify.notify_waiters();
+    }
+
+    async fn wait(&self) {
+        if self.aborted.load(Ordering::SeqCst) {
+            return;
+        }
+        let notified = self.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if self.aborted.load(Ordering::SeqCst) {
+            return;
+        }
+        notified.await;
     }
 }
 
 pub struct AbortBridge {
-    notify: Arc<Notify>,
+    flag: Arc<AbortFlag>,
 }
 
 impl FromNapiValue for AbortBridge {
     unsafe fn from_napi_value(env: sys::napi_env, napi_val: sys::napi_value) -> Result<Self> {
-        let signal = unsafe { AbortSignal::from_napi_value(env, napi_val)? };
-        let notify = Arc::new(Notify::new());
-        let trigger = notify.clone();
-        signal.on_abort(move || trigger.notify_one());
-        Ok(AbortBridge { notify })
+        let mut object = Object::from_raw(env, napi_val);
+        let flag = match object.get::<ExternalRef<Arc<AbortFlag>>>(ABORT_SLOT)? {
+            Some(cached) => Arc::clone(&cached),
+            None => {
+                let flag = Arc::new(AbortFlag::new());
+                let signal = unsafe { AbortSignal::from_napi_value(env, napi_val)? };
+                let trigger = Arc::clone(&flag);
+                signal.on_abort(move || trigger.trigger());
+                object.set(ABORT_SLOT, External::new(Arc::clone(&flag)))?;
+                flag
+            }
+        };
+        if object.get::<bool>("aborted")?.unwrap_or(false) {
+            flag.trigger();
+        }
+        Ok(AbortBridge { flag })
     }
 }
 
@@ -285,36 +426,41 @@ async fn run_query(
     sql: &str,
     params: &[Param],
     timeout_ms: Option<u32>,
-    signal: Option<AbortBridge>,
-) -> Result<Vec<RowObject>> {
-    let statement = client.prepare_cached(sql).await.map_err(map_pg_error)?;
+    abort: Option<Arc<AbortFlag>>,
+) -> (Result<Vec<RowObject>>, bool) {
+    let statement = match client.prepare_cached(sql).await {
+        Ok(statement) => statement,
+        Err(error) => return (Err(map_pg_error(error)), true),
+    };
     let bind: Vec<&(dyn ToSql + Sync)> =
         params.iter().map(|param| param as &(dyn ToSql + Sync)).collect();
     let token = client.cancel_token();
-    let abort = signal.map(|bridge| bridge.notify);
     let timeout = timeout_ms.map(|ms| Duration::from_millis(ms as u64));
 
     let query_future = client.query(&statement, &bind);
     tokio::pin!(query_future);
 
-    let rows = tokio::select! {
-        result = &mut query_future => result.map_err(map_pg_error)?,
-        _ = sleep_opt(timeout) => {
-            let _ = token.cancel_query(NoTls).await;
-            let _ = (&mut query_future).await;
-            return Err(Error::from_reason(format!(
-                "query: cancelled after timeout of {}ms",
-                timeout.map(|value| value.as_millis()).unwrap_or(0)
-            )));
+    let reason = tokio::select! {
+        result = &mut query_future => {
+            return (
+                result
+                    .map_err(map_pg_error)
+                    .and_then(|rows| rows.iter().map(row_to_object).collect()),
+                true,
+            );
         }
-        _ = notified_opt(&abort) => {
-            let _ = token.cancel_query(NoTls).await;
-            let _ = (&mut query_future).await;
-            return Err(Error::from_reason("query: aborted by signal"));
-        }
+        _ = sleep_opt(timeout) => format!(
+            "query: cancelled after timeout of {}ms",
+            timeout.map(|value| value.as_millis()).unwrap_or(0)
+        ),
+        _ = abort_opt(&abort) => "query: aborted by signal".to_string(),
     };
-
-    rows.iter().map(row_to_object).collect()
+    let settle = async {
+        let _ = token.cancel_query(NoTls).await;
+        let _ = (&mut query_future).await;
+    };
+    let clean = tokio::time::timeout(DRAIN_GRACE, settle).await.is_ok();
+    (Err(Error::from_reason(reason)), clean)
 }
 
 async fn sleep_opt(timeout: Option<Duration>) {
@@ -324,9 +470,9 @@ async fn sleep_opt(timeout: Option<Duration>) {
     }
 }
 
-async fn notified_opt(abort: &Option<Arc<Notify>>) {
+async fn abort_opt(abort: &Option<Arc<AbortFlag>>) {
     match abort {
-        Some(notify) => notify.notified().await,
+        Some(flag) => flag.wait().await,
         None => pending().await,
     }
 }
@@ -337,7 +483,14 @@ fn map_pg_error(error: tokio_postgres::Error) -> Error {
     } else if is_connection_error(&error) {
         Error::from_reason(format!("[SQLSTATE 08006] {error}"))
     } else {
-        Error::from_reason(error.to_string())
+        let mut message = error.to_string();
+        let mut source = error.source();
+        while let Some(inner) = source {
+            message.push_str(": ");
+            message.push_str(&inner.to_string());
+            source = inner.source();
+        }
+        Error::from_reason(message)
     }
 }
 
@@ -353,6 +506,11 @@ fn is_connection_error(error: &tokio_postgres::Error) -> bool {
         source = inner.source();
     }
     false
+}
+
+fn is_sqlstate(error: &Error, code: &str) -> bool {
+    error.reason.starts_with("[SQLSTATE ")
+        && error.reason.as_bytes().get(10..15) == Some(code.as_bytes())
 }
 
 struct PreferStandbyConnect {
@@ -395,9 +553,13 @@ async fn connect_and_spawn(
     Ok((client, handle))
 }
 
-fn writable_check() -> Hook {
-    Hook::async_fn(|client, _metrics| {
+fn writable_check(interval: Duration) -> Hook {
+    Hook::async_fn(move |client, metrics| {
+        let fresh = !interval.is_zero() && metrics.last_used() < interval;
         Box::pin(async move {
+            if fresh {
+                return Ok(());
+            }
             match client.query_one("SHOW transaction_read_only", &[]).await {
                 Ok(row) => {
                     let read_only: String = row.get(0);
@@ -415,16 +577,37 @@ fn writable_check() -> Hook {
     })
 }
 
-async fn checkout(pool: &DeadpoolPool, window: Duration) -> Result<PooledClient> {
+async fn checkout(
+    pool: &DeadpoolPool,
+    window: Duration,
+    unavailable: &str,
+) -> Result<PooledClient> {
     let start = Instant::now();
     let mut backoff = Duration::from_millis(50);
     loop {
-        match pool.get().await {
-            Ok(client) => return Ok(client),
-            Err(error) => {
+        let remaining = window.saturating_sub(start.elapsed());
+        match tokio::time::timeout(remaining, pool.get()).await {
+            Err(_) => {
+                return Err(Error::from_reason(format!(
+                    "[SQLSTATE 53300] query: no connection available within {}ms (pool busy or {unavailable})",
+                    window.as_millis()
+                )))
+            }
+            Ok(Ok(client)) => return Ok(client),
+            Ok(Err(PoolError::Closed)) => {
+                return Err(Error::from_reason(
+                    "query: the pool is closed (end() was called)",
+                ))
+            }
+            Ok(Err(error)) => {
+                if let Some(code) = fatal_sqlstate(&error) {
+                    return Err(Error::from_reason(format!(
+                        "[SQLSTATE {code}] query: {error}"
+                    )));
+                }
                 if start.elapsed() >= window {
                     return Err(Error::from_reason(format!(
-                        "[SQLSTATE 08006] query: no writable primary available after {}ms: {error}",
+                        "[SQLSTATE 08006] query: {unavailable} after {}ms: {error}",
                         window.as_millis()
                     )));
                 }
@@ -433,6 +616,18 @@ async fn checkout(pool: &DeadpoolPool, window: Duration) -> Result<PooledClient>
             }
         }
     }
+}
+
+fn fatal_sqlstate(error: &PoolError) -> Option<String> {
+    if let PoolError::Backend(backend) = error {
+        if let Some(db) = backend.as_db_error() {
+            let code = db.code().code();
+            if code.starts_with("28") || code == "3D000" {
+                return Some(code.to_string());
+            }
+        }
+    }
+    None
 }
 
 pub enum Cell {
@@ -472,7 +667,7 @@ impl ToNapiValue for RowObject {
         for (name, cell) in value.0 {
             object.set(name.as_str(), cell)?;
         }
-        unsafe { ToNapiValue::to_napi_value(env, &object) }
+        unsafe { ToNapiValue::to_napi_value(env, object) }
     }
 }
 
@@ -488,11 +683,23 @@ fn row_to_object(row: &Row) -> Result<RowObject> {
     Ok(RowObject(fields))
 }
 
-fn cell_from_column(row: &Row, index: usize, ty: &Type) -> Result<Cell> {
-    if let Kind::Array(member) = ty.kind() {
-        return array_cell(row, index, member);
+fn base_type(ty: &Type) -> &Type {
+    let mut ty = ty;
+    while let Kind::Domain(inner) = ty.kind() {
+        ty = inner;
     }
-    scalar_cell(row, index, ty.name())
+    ty
+}
+
+fn cell_from_column(row: &Row, index: usize, ty: &Type) -> Result<Cell> {
+    let ty = base_type(ty);
+    match ty.kind() {
+        Kind::Array(member) => array_cell(row, index, base_type(member)),
+        Kind::Enum(_) => Ok(opt(get::<EnumText>(row, index)?, |value| {
+            Cell::Text(value.0)
+        })),
+        _ => scalar_cell(row, index, ty.name()),
+    }
 }
 
 fn scalar_cell(row: &Row, index: usize, name: &str) -> Result<Cell> {
@@ -528,6 +735,9 @@ fn scalar_cell(row: &Row, index: usize, name: &str) -> Result<Cell> {
 }
 
 fn array_cell(row: &Row, index: usize, member: &Type) -> Result<Cell> {
+    if matches!(member.kind(), Kind::Enum(_)) {
+        return list_of(row, index, |value: EnumText| Cell::Text(value.0));
+    }
     match member.name() {
         "bool" => list_of(row, index, Cell::Bool),
         "int2" => list_of(row, index, |value: i16| Cell::Int(value as i32)),
@@ -551,8 +761,37 @@ fn array_cell(row: &Row, index: usize, member: &Type) -> Result<Cell> {
     }
 }
 
+struct Underlying<T>(T);
+
+impl<'a, T: FromSql<'a>> FromSql<'a> for Underlying<T> {
+    fn from_sql(ty: &Type, raw: &'a [u8]) -> std::result::Result<Self, SqlError> {
+        T::from_sql(base_type(ty), raw).map(Underlying)
+    }
+
+    fn from_sql_null(ty: &Type) -> std::result::Result<Self, SqlError> {
+        T::from_sql_null(base_type(ty)).map(Underlying)
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        T::accepts(base_type(ty))
+    }
+}
+
+struct EnumText(String);
+
+impl<'a> FromSql<'a> for EnumText {
+    fn from_sql(_ty: &Type, raw: &'a [u8]) -> std::result::Result<Self, SqlError> {
+        Ok(EnumText(std::str::from_utf8(raw)?.to_string()))
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        matches!(ty.kind(), Kind::Enum(_))
+    }
+}
+
 fn get<'a, T: FromSql<'a>>(row: &'a Row, index: usize) -> Result<Option<T>> {
-    row.try_get::<usize, Option<T>>(index)
+    row.try_get::<usize, Option<Underlying<T>>>(index)
+        .map(|value| value.map(|wrapped| wrapped.0))
         .map_err(|error| Error::from_reason(error.to_string()))
 }
 
@@ -563,10 +802,7 @@ fn opt<T>(value: Option<T>, map: impl FnOnce(T) -> Cell) -> Cell {
 struct RawWkb(String);
 
 impl<'a> FromSql<'a> for RawWkb {
-    fn from_sql(
-        _ty: &Type,
-        raw: &'a [u8],
-    ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+    fn from_sql(_ty: &Type, raw: &'a [u8]) -> std::result::Result<Self, SqlError> {
         use std::fmt::Write;
         let mut hex = String::with_capacity(raw.len() * 2);
         for byte in raw {
@@ -585,12 +821,12 @@ where
     T: FromSql<'a>,
     F: Fn(T) -> Cell,
 {
-    match get::<Vec<Option<T>>>(row, index)? {
+    match get::<Vec<Option<Underlying<T>>>>(row, index)? {
         None => Ok(Cell::Null),
         Some(items) => Ok(Cell::List(
             items
                 .into_iter()
-                .map(|item| item.map(&map).unwrap_or(Cell::Null))
+                .map(|item| item.map(|wrapped| map(wrapped.0)).unwrap_or(Cell::Null))
                 .collect(),
         )),
     }
@@ -644,7 +880,7 @@ fn iso_time(value: PgTime) -> String {
 struct PgNumeric(String);
 
 impl<'a> FromSql<'a> for PgNumeric {
-    fn from_sql(_ty: &Type, raw: &'a [u8]) -> std::result::Result<Self, Box<dyn StdError + Sync + Send>> {
+    fn from_sql(_ty: &Type, raw: &'a [u8]) -> std::result::Result<Self, SqlError> {
         Ok(PgNumeric(numeric_to_string(raw)?))
     }
 
@@ -653,7 +889,7 @@ impl<'a> FromSql<'a> for PgNumeric {
     }
 }
 
-fn numeric_to_string(raw: &[u8]) -> std::result::Result<String, Box<dyn StdError + Sync + Send>> {
+fn numeric_to_string(raw: &[u8]) -> std::result::Result<String, SqlError> {
     if raw.len() < 8 {
         return Err("numeric: truncated header".into());
     }
@@ -716,6 +952,91 @@ fn numeric_to_string(raw: &[u8]) -> std::result::Result<String, Box<dyn StdError
     }
 
     Ok(out)
+}
+
+fn write_numeric(text: &str, out: &mut BytesMut) -> SqlResult {
+    let trimmed = text.trim();
+    let special = match trimmed {
+        "NaN" => Some(0xC000u16),
+        "Infinity" | "inf" => Some(0xD000),
+        "-Infinity" | "-inf" => Some(0xF000),
+        _ => None,
+    };
+    if let Some(sign) = special {
+        out.put_i16(0);
+        out.put_i16(0);
+        out.put_u16(sign);
+        out.put_u16(0);
+        return Ok(IsNull::No);
+    }
+
+    let (mut negative, digits) = match trimmed.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, trimmed.strip_prefix('+').unwrap_or(trimmed)),
+    };
+    let mut parts = digits.splitn(2, '.');
+    let int_part = parts.next().unwrap_or("");
+    let frac_part = parts.next().unwrap_or("");
+    let valid = !(int_part.is_empty() && frac_part.is_empty())
+        && int_part.bytes().all(|byte| byte.is_ascii_digit())
+        && frac_part.bytes().all(|byte| byte.is_ascii_digit());
+    if !valid {
+        return Err(format!(
+            "query: `{text}` is not a valid numeric literal (scientific notation is not supported)"
+        )
+        .into());
+    }
+
+    let int_digits = int_part.trim_start_matches('0');
+    let dscale = frac_part.len();
+    if dscale > 0x3FFF {
+        return Err("query: numeric scale too large".into());
+    }
+
+    let lead = (4 - int_digits.len() % 4) % 4;
+    let mut digit_string = String::with_capacity(lead + int_digits.len() + frac_part.len() + 3);
+    for _ in 0..lead {
+        digit_string.push('0');
+    }
+    digit_string.push_str(int_digits);
+    digit_string.push_str(frac_part);
+    while !digit_string.len().is_multiple_of(4) {
+        digit_string.push('0');
+    }
+
+    let mut groups: Vec<i16> = digit_string
+        .as_bytes()
+        .chunks(4)
+        .map(|chunk| chunk.iter().fold(0i16, |acc, byte| acc * 10 + (byte - b'0') as i16))
+        .collect();
+
+    let mut weight = ((lead + int_digits.len()) / 4) as i64 - 1;
+    while let Some(first) = groups.first() {
+        if *first != 0 {
+            break;
+        }
+        groups.remove(0);
+        weight -= 1;
+    }
+    while groups.last() == Some(&0) {
+        groups.pop();
+    }
+    if groups.is_empty() {
+        weight = 0;
+        negative = false;
+    }
+    if groups.len() > i16::MAX as usize || weight > i16::MAX as i64 || weight < i16::MIN as i64 {
+        return Err("query: numeric value out of range".into());
+    }
+
+    out.put_i16(groups.len() as i16);
+    out.put_i16(weight as i16);
+    out.put_u16(if negative { 0x4000 } else { 0x0000 });
+    out.put_u16(dscale as u16);
+    for group in groups {
+        out.put_i16(group);
+    }
+    Ok(IsNull::No)
 }
 
 #[derive(Clone, Debug)]
@@ -784,8 +1105,9 @@ impl ToSql for Param {
             Param::Big(value) => big_to_sql(*value, ty, out),
             Param::Text(value) => match ty.name() {
                 "uuid" => Uuid::parse_str(value)
-                    .map_err(|error| Box::new(error) as Box<dyn StdError + Sync + Send>)?
+                    .map_err(|error| Box::new(error) as SqlError)?
                     .to_sql(ty, out),
+                "numeric" => write_numeric(value, out),
                 _ => value.to_sql(ty, out),
             },
             Param::Bytes(value) => value.as_slice().to_sql(ty, out),
@@ -802,24 +1124,58 @@ impl ToSql for Param {
     to_sql_checked!();
 }
 
+fn lossy(value: impl std::fmt::Display, ty: &str) -> SqlError {
+    format!("query: parameter {value} does not fit column type {ty}").into()
+}
+
+fn checked_int<T: TryFrom<i64>>(value: f64, ty: &str) -> std::result::Result<T, SqlError> {
+    if !value.is_finite() || value.fract() != 0.0 {
+        return Err(lossy(value, ty));
+    }
+    if !(-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&value) {
+        return Err(lossy(value, ty));
+    }
+    T::try_from(value as i64).map_err(|_| lossy(value, ty))
+}
+
 fn float_to_sql(value: f64, ty: &Type, out: &mut BytesMut) -> SqlResult {
     match ty.name() {
-        "int2" => (value as i16).to_sql(ty, out),
-        "int4" => (value as i32).to_sql(ty, out),
-        "int8" => (value as i64).to_sql(ty, out),
-        "oid" => (value as u32).to_sql(ty, out),
+        "int2" => checked_int::<i16>(value, "int2")?.to_sql(ty, out),
+        "int4" => checked_int::<i32>(value, "int4")?.to_sql(ty, out),
+        "int8" => checked_int::<i64>(value, "int8")?.to_sql(ty, out),
+        "oid" => checked_int::<u32>(value, "oid")?.to_sql(ty, out),
         "float4" => (value as f32).to_sql(ty, out),
+        "numeric" => write_numeric(&value.to_string(), out),
         _ => value.to_sql(ty, out),
     }
 }
 
 fn big_to_sql(value: i64, ty: &Type, out: &mut BytesMut) -> SqlResult {
     match ty.name() {
-        "int2" => (value as i16).to_sql(ty, out),
-        "int4" => (value as i32).to_sql(ty, out),
-        "oid" => (value as u32).to_sql(ty, out),
-        "float4" => (value as f32).to_sql(ty, out),
-        "float8" => (value as f64).to_sql(ty, out),
+        "int2" => i16::try_from(value)
+            .map_err(|_| lossy(value, "int2"))?
+            .to_sql(ty, out),
+        "int4" => i32::try_from(value)
+            .map_err(|_| lossy(value, "int4"))?
+            .to_sql(ty, out),
+        "oid" => u32::try_from(value)
+            .map_err(|_| lossy(value, "oid"))?
+            .to_sql(ty, out),
+        "float4" => {
+            let float = value as f32;
+            if float as i64 != value {
+                return Err(lossy(value, "float4"));
+            }
+            float.to_sql(ty, out)
+        }
+        "float8" => {
+            let float = value as f64;
+            if float as i64 != value {
+                return Err(lossy(value, "float8"));
+            }
+            float.to_sql(ty, out)
+        }
+        "numeric" => write_numeric(&value.to_string(), out),
         _ => value.to_sql(ty, out),
     }
 }

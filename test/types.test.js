@@ -94,3 +94,57 @@ test('bigint array round-trips losslessly', async () => {
   assert.deepEqual(r.xs, [1n, 9007199254740993n, -5n])
   assert.equal(typeof r.xs[1], 'bigint')
 })
+
+test('enum columns and enum arrays decode as strings', async () => {
+  await pool.query('drop table if exists t_mood')
+  await pool.query("drop type if exists mood_t")
+  await pool.query("create type mood_t as enum ('sad', 'ok', 'happy')")
+  try {
+    await pool.query('create table t_mood (m mood_t, ms mood_t[])')
+    await pool.query("insert into t_mood values ('happy', array['sad','ok']::mood_t[])")
+    const [r] = await pool.query('select m, ms from t_mood')
+    assert.equal(r.m, 'happy')
+    assert.deepEqual(r.ms, ['sad', 'ok'])
+  } finally {
+    await pool.query('drop table if exists t_mood')
+    await pool.query('drop type if exists mood_t')
+  }
+})
+
+test('number, string and bigint params bind directly to numeric', async () => {
+  const [r] = await pool.query(
+    'select $1::numeric a, $2::numeric b, $3::numeric c, $4::numeric d, $5::numeric e',
+    [12.5, '12345.6789', 42n, '-0.000123', '99999999999999999999.0001'],
+  )
+  assert.equal(r.a, '12.5')
+  assert.equal(r.b, '12345.6789')
+  assert.equal(r.c, '42')
+  assert.equal(r.d, '-0.000123')
+  assert.equal(r.e, '99999999999999999999.0001')
+})
+
+test('numeric params round-trip through a table column', async () => {
+  await pool.query('drop table if exists t_num')
+  await pool.query('create table t_num (v numeric)')
+  try {
+    for (const value of ['0', '0.0000', '-12.50', '10000', '0.000123', 'NaN']) {
+      await pool.query('truncate t_num')
+      await pool.query('insert into t_num values ($1)', [value])
+      const [r] = await pool.query('select v from t_num')
+      assert.equal(r.v, value === '0.0000' ? '0.0000' : value)
+    }
+  } finally {
+    await pool.query('drop table if exists t_num')
+  }
+})
+
+test('lossy numeric parameters are rejected instead of truncated', async () => {
+  await assert.rejects(() => pool.query('select $1::int4', [3.7]), /does not fit/)
+  await assert.rejects(() => pool.query('select $1::int2', [70000n]), /does not fit/)
+  await assert.rejects(() => pool.query('select $1::int4', [1e10]), /does not fit/)
+  await assert.rejects(() => pool.query('select $1::int8', [1.5]), /does not fit/)
+  const [ok] = await pool.query('select $1::int2 a, $2::int4 b, $3::int8 c', [123, -456, 789n])
+  assert.equal(ok.a, 123)
+  assert.equal(ok.b, -456)
+  assert.equal(ok.c, 789n)
+})

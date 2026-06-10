@@ -77,6 +77,88 @@ test('transaction does not retry a deterministic error', async () => {
   assert.equal(attempts, 1)
 })
 
+test('transaction retries on a read-only (fence) error', async () => {
+  let attempts = 0
+  await pool.transaction(async () => {
+    attempts += 1
+    if (attempts === 1) {
+      const error = new Error('cannot execute INSERT in a read-only transaction')
+      error.code = '25006'
+      throw error
+    }
+  })
+  assert.equal(attempts, 2)
+})
+
+test('transaction isolation level is applied', async () => {
+  const level = await pool.transaction(async (tx) => {
+    const [row] = await tx.query('show transaction_isolation')
+    return row.transaction_isolation
+  }, { isolation: 'serializable' })
+  assert.equal(level, 'serializable')
+
+  const tx = await pool.begin({ isolation: 'repeatable-read' })
+  const [row] = await tx.query('show transaction_isolation')
+  await tx.rollback()
+  assert.equal(row.transaction_isolation, 'repeatable read')
+})
+
+test('query on a closed pool fails fast', async () => {
+  const closed = singleNodePool()
+  await closed.query('select 1')
+  await closed.end()
+  const start = Date.now()
+  await assert.rejects(() => closed.query('select 1'), /pool is closed/)
+  assert.ok(Date.now() - start < 1000, 'closed pool should fail immediately')
+})
+
+test('acquireTimeoutMs bounds waiting on an exhausted pool', async () => {
+  const tiny = singleNodePool(undefined, { poolSize: 1, acquireTimeoutMs: 800 })
+  try {
+    const hog = tiny.query('select pg_sleep(3)')
+    await new Promise((resolve) => setTimeout(resolve, 200))
+    const start = Date.now()
+    await assert.rejects(
+      () => tiny.query('select 1'),
+      (error) => error.code === '53300',
+    )
+    const elapsed = Date.now() - start
+    assert.ok(elapsed >= 500 && elapsed < 2500, `expected ~800ms, got ${elapsed}ms`)
+    await hog
+  } finally {
+    await tiny.end()
+  }
+})
+
+test('timeoutMs cancels an in-flight query server-side', async () => {
+  const start = Date.now()
+  await assert.rejects(
+    () => pool.query('select pg_sleep(5)', [], { timeoutMs: 500 }),
+    /cancelled after timeout/,
+  )
+  assert.ok(Date.now() - start < 2500)
+  const [r] = await pool.query('select 1 as ok')
+  assert.equal(r.ok, 1)
+})
+
+test('abort signal cancels in-flight and pre-aborted queries, signal is reusable', async () => {
+  const ac = new AbortController()
+  setTimeout(() => ac.abort(), 300)
+  await assert.rejects(
+    () => pool.query('select pg_sleep(5)', [], { signal: ac.signal }),
+    /aborted/,
+  )
+  await assert.rejects(
+    () => pool.query('select 1', [], { signal: ac.signal }),
+    (error) => error.code === 'ABORT_ERR',
+  )
+  const fresh = new AbortController()
+  for (let i = 0; i < 5; i += 1) {
+    const [r] = await pool.query('select $1::int4 v', [i], { signal: fresh.signal })
+    assert.equal(r.v, i)
+  }
+})
+
 test('connection failure during COMMIT surfaces IN_DOUBT and is not retried', async () => {
   const realBegin = pool.begin.bind(pool)
   let begins = 0

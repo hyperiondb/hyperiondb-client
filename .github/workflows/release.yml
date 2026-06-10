@@ -161,6 +161,7 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           npm version ${{ needs.version.outputs.version }} --no-git-tag-version --allow-same-version
           sed -i -E "0,/^version = \".*\"/ s//version = \"${{ needs.version.outputs.version }}\"/" Cargo.toml
-          git add package.json Cargo.toml
+          sed -i -E "/^name = \"hyperiondb-client\"$/{n;s/^version = \".*\"/version = \"${{ needs.version.outputs.version }}\"/}" Cargo.lock
+          git add package.json Cargo.toml Cargo.lock
           git commit -m "release: v${{ needs.version.outputs.version }}"
           git push origin HEAD:${{ github.ref_name }}

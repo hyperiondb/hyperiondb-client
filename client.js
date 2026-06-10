@@ -33,8 +33,12 @@ function isConnectionError(error) {
   return !!error && !!error.code && CONNECTION_SQLSTATE.has(error.code)
 }
 
+function isReadOnly(error) {
+  return !!error && error.code === '25006'
+}
+
 function isRetryable(error) {
-  return isSerialization(error) || isConnectionError(error)
+  return isSerialization(error) || isConnectionError(error) || isReadOnly(error)
 }
 
 function inDoubt(cause) {
@@ -141,6 +145,7 @@ class Pool {
   }
 
   async insert(table, row, opts) {
+    checkAborted(opts)
     const columns = Object.keys(row)
     const placeholders = columns.map((_, index) => '$' + (index + 1)).join(', ')
     const params = columns.map((column) => row[column])
@@ -161,7 +166,7 @@ class Pool {
           this._inner.query(sql, params, opts?.timeoutMs ?? null, opts?.signal ?? null),
         )
       } catch (error) {
-        if (idempotent && isRetryable(error) && attempt < max) {
+        if (idempotent && isRetryable(error) && attempt < max && !opts?.signal?.aborted) {
           await sleep(backoff(attempt, this._retry))
           continue
         }
@@ -170,8 +175,8 @@ class Pool {
     }
   }
 
-  async begin() {
-    const inner = await guard(() => this._inner.begin())
+  async begin(opts) {
+    const inner = await guard(() => this._inner.begin(opts?.isolation ?? null))
     return new Transaction(inner, this._logger)
   }
 
@@ -180,7 +185,7 @@ class Pool {
     for (let attempt = 1; ; attempt += 1) {
       let tx
       try {
-        tx = await this.begin()
+        tx = await this.begin(opts)
         const result = await callback(tx)
         try {
           await tx.commit()

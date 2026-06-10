@@ -14,9 +14,12 @@ npm install hyperiondb-client
 ```
 
 Prebuilt binaries ship as per-platform optional dependencies
-(`hyperiondb-client-<triple>`) for Windows x64, macOS x64/arm64, and Linux x64/arm64
-(`gnu` and `musl`); npm installs only the one matching your platform. No Rust toolchain or
-build step is needed to consume the package.
+(`hyperiondb-client-<triple>`) for Linux x64/arm64 (`gnu` and `musl`); npm installs only the
+one matching your platform, so no Rust toolchain or build step is needed there. On other
+platforms (Windows, macOS) build from source as below.
+
+Connections are plain TCP (no TLS) — run the client on the same trusted network as the
+cluster.
 
 ## Build (from source)
 
@@ -53,6 +56,7 @@ const pool = createPool({
   connectTimeoutMs: 2000,   // per-connection TCP/handshake timeout
   acquireTimeoutMs: 5000,   // how long query() retries for a writable primary before throwing
   statementTimeoutMs: 30000,// server-enforced statement_timeout on every connection (optional)
+  validationIntervalMs: 0,  // see "Failover behavior" below (optional)
   logger: (e) => console.log(e.sql, e.durationMs, e.rowCount ?? e.error?.code), // optional
 })
 
@@ -64,7 +68,8 @@ await pool.end()
 A `read-write` pool opens every connection with `target_session_attrs=read-write`, so it
 resolves the current primary at connect time and follows a failover on reconnect — no proxy
 and no application awareness of which node is primary. `query` returns rows as plain objects
-keyed by column name; `end` drains the pool.
+keyed by column name; `end` closes the pool (in-flight queries finish on their own
+connections; new checkouts fail immediately).
 
 ### Failover behavior
 
@@ -74,6 +79,18 @@ checkout validation: before reusing a pooled connection it runs `SHOW transactio
 and evicts the connection if it is `on`, then opens a fresh one that re-resolves the new
 primary. When no writable primary is reachable yet (mid-election), `query` retries with
 backoff up to `acquireTimeoutMs` and then throws `no writable primary available after <ms>ms`.
+
+`validationIntervalMs` trades that round-trip for latency: set it to e.g. `500` and a
+connection validated within the last 500ms skips the `SHOW`. The fence still cannot slip
+through — a write that lands on a fenced connection fails with `25006`, the connection is
+evicted, and the query is retried on a fresh checkout within the same `acquireTimeoutMs`
+budget (a `25006` inside an explicit transaction is retried by `transaction(cb)` the same
+way). The default `0` validates on every checkout.
+
+`acquireTimeoutMs` also bounds waiting on an exhausted pool: when all `poolSize` connections
+are busy past the window, `query` throws with `code === '53300'` instead of queueing forever.
+Auth failures (`28xxx`) and a missing database (`3D000`) are not retried — they throw
+immediately. A `query` after `end()` throws `pool is closed` immediately.
 
 ### Read scaling
 
@@ -96,7 +113,7 @@ const id = await pool.transaction(async (tx) => {
 })
 
 // Or a checked-out connection you drive yourself:
-const tx = await pool.begin()
+const tx = await pool.begin()  // or pool.begin({ isolation: 'serializable' })
 try {
   await tx.query('insert into t (x) values ($1)', [2])
   await tx.commit()
@@ -107,7 +124,11 @@ try {
 ```
 
 All statements in a transaction run on one dedicated connection. Repeated SQL reuses a
-server-side prepared statement (deadpool `prepare_cached`).
+server-side prepared statement (deadpool `prepare_cached`). Both `begin` and
+`transaction(cb)` accept `{ isolation: 'read-committed' | 'repeatable-read' | 'serializable' }`
+(`transaction(cb)` pairs naturally with `serializable`, since it already retries `40001`).
+A transaction abandoned without `commit()`/`rollback()` is rolled back and its connection
+destroyed when the object is garbage-collected — it never returns to the pool mid-transaction.
 
 ## Retries & idempotency
 
@@ -146,7 +167,10 @@ per-statement dedup token.
 ## Cancellation & timeouts
 
 `query` takes an optional third argument. Both a timeout and an `AbortSignal` cancel the
-in-flight query **server-side** via the connection's `cancel_token`:
+in-flight query **server-side** via the connection's `cancel_token`. If the cancel itself
+hangs (node unreachable mid-partition), the call still returns after a ~1s grace period and
+the affected connection is destroyed rather than reused. One `AbortSignal` can safely be
+reused across many queries (a request-scoped controller registers a single listener):
 
 ```js
 await pool.query('select pg_sleep(10)', [], { timeoutMs: 2000 })   // throws after ~2s
@@ -190,6 +214,7 @@ ignored). Set `statementTimeoutMs` to have the server cancel any statement that 
 | `float4`, `float8` | `number` |
 | `numeric` | `string` (arbitrary precision) |
 | `text`, `varchar`, `bpchar`, `name` | `string` |
+| enum types | `string` (the label) |
 | `uuid` | `string` |
 | `bytea` | `Buffer` |
 | `json`, `jsonb` | parsed value (object/array/scalar) |
@@ -198,10 +223,13 @@ ignored). Set `statementTimeoutMs` to have the server cancel any statement that 
 
 Parameters accept the inverse: `null`, `boolean`, `number`, `BigInt`, `string`, `Buffer`
 (→ `bytea`), `Date` (→ `timestamptz`), arrays (→ a Postgres array when the target column is
-an array type, otherwise `jsonb`), and plain objects (→ `jsonb`). To write a `string` into a
-`numeric`/`uuid` column, cast at the call site (`$1::text::numeric`).
+an array type, otherwise `jsonb`), and plain objects (→ `jsonb`). `number`, `BigInt` and
+`string` values bind directly to `numeric` columns; `string` binds to `uuid`. A `number` or
+`BigInt` that does not fit the target integer column (fractional part, out of range) throws
+instead of silently truncating. Domain types decode as their base type.
 
-A host entry may carry its own port (`'10.0.0.1:5433'`); otherwise `port` applies to all hosts.
+A host entry may carry its own port (`'10.0.0.1:5433'`); IPv6 addresses use brackets
+(`'[::1]:5433'`). Otherwise `port` applies to all hosts.
 
 ## Testing
 
@@ -220,8 +248,11 @@ relocates the primary.
 
 ## Releasing
 
+`.github/workflows/test.yml` runs clippy, builds the addon, and runs `npm test` against a
+single-node Postgres service container on every push and pull request.
+
 `.github/workflows/release.yml` runs when a commit pushed to `main` contains `[cd]` in its
-message. It cross-builds the seven native targets, bumps the patch version (syncing
+message. It cross-builds the four Linux targets, bumps the patch version (syncing
 `Cargo.toml`), commits the bump back, then publishes the per-platform
 `hyperiondb-client-<triple>` packages and the main package to npm. The bump commit has no
 `[cd]`, so it doesn't re-trigger a build/publish. Requires an `NPM_TOKEN` repository secret

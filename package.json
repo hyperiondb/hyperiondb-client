@@ -13,7 +13,11 @@
     "replication"
   ],
   "engines": {
-    "node": ">= v24"
+    "node": ">= 20"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hyperiondb/hyperiondb-client.git"
   },
   "author": "Tadas Talaikis <info@nordlet.com>",
   "napi": {

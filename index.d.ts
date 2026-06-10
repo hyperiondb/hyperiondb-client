@@ -2,7 +2,7 @@
 /* eslint-disable */
 export declare class Pool {
   query(sql: string, params?: Array<any> | null, timeoutMs?: number | null, signal?: AbortSignal | null): Promise<Array<Record<string, any>>>
-  begin(): Promise<Transaction>
+  begin(isolation?: string | undefined | null): Promise<Transaction>
   status(): PoolStatus
   end(): Promise<void>
 }
@@ -27,6 +27,7 @@ export interface PoolOptions {
   connectTimeoutMs?: number
   acquireTimeoutMs?: number
   statementTimeoutMs?: number
+  validationIntervalMs?: number
   mode?: string
   applicationName?: string
 }
