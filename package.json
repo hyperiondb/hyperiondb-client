@@ -1,6 +1,6 @@
 {
   "name": "hyperiondb-client",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "description": "Native Node.js client for a HyperionDb / pg_replica Postgres cluster — a primary-following connection pool over the N nodes.",
   "main": "client.js",
   "types": "client.d.ts",
