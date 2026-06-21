@@ -4,7 +4,7 @@
   "description": "Native Node.js client for a HyperionDb / pg_replica Postgres cluster — a primary-following connection pool over the N nodes.",
   "main": "client.js",
   "types": "client.d.ts",
-  "license": "GPL-3.0-or-later",
+  "license": "AGPL-3.0-only",
   "keywords": [
     "postgres",
     "raft",

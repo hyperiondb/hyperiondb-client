@@ -4,21 +4,21 @@ version = "0.2.3"
 edition = "2021"
 publish = false
 description = "Native Node.js client for a HyperionDb / pg_replica Postgres cluster"
-license = "GPL-3.0-or-later"
+license = "AGPL-3.0-only"
 
 [lib]
 crate-type = ["cdylib"]
 
 [dependencies]
-napi = { version = "=3.9.0", default-features = false, features = ["napi6", "async", "serde-json"] }
+napi = { version = "=3.9.3", default-features = false, features = ["napi6", "async", "serde-json"] }
 napi-derive = "=3.5.6"
-tokio-postgres = { version = "=0.7.17", features = ["with-serde_json-1", "with-uuid-1", "with-time-0_3"] }
+tokio-postgres = { version = "=0.7.18", features = ["with-serde_json-1", "with-uuid-1", "with-time-0_3"] }
 deadpool-postgres = "=0.14.1"
 tokio = { version = "=1.52.3", features = ["rt", "time", "sync", "macros"] }
 serde_json = "=1.0.150"
-bytes = "=1.11.1"
-time = "=0.3.47"
-uuid = "=1.23.2"
+bytes = "=1.12.0"
+time = "=0.3.49"
+uuid = "=1.23.3"
 
 [build-dependencies]
 napi-build = "=2.3.2"
